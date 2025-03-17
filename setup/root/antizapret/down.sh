@@ -27,7 +27,6 @@ iptables -w -D OUTPUT -m conntrack --ctstate INVALID -j DROP
 # nat
 # OpenVPN UDP port redirection for backup connections
 iptables -w -t nat -D PREROUTING -i "$INTERFACE" -p udp --dport 80 -j REDIRECT --to-ports 50080
-iptables -w -t nat -D PREROUTING -i "$INTERFACE" -p udp --dport 443 -j REDIRECT --to-ports 50443
 # MASQUERADE
 iptables -w -t nat -D POSTROUTING -s 10.28.0.0/15 -o "$INTERFACE" -j SNAT --to-source $HOST_IP
 iptables -w -t nat -D POSTROUTING -s 172.28.0.0/15 -o "$INTERFACE" -j SNAT --to-source $HOST_IP
