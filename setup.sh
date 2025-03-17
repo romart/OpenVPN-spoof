@@ -276,7 +276,7 @@ fi
 # Настраиваем сервера OpenVPN и WireGuard/AmneziaWG для первого запуска
 # Пересоздаем для всех существующих пользователей файлы подключений
 # Если пользователей нет, то создаем новых пользователей 'antizapret-client' для OpenVPN и WireGuard/AmneziaWG
-/root/antizapret/client.sh 7
+/root/antizapret/client.sh 4
 
 systemctl enable antizapret
 systemctl enable openvpn-server@vpn-udp
