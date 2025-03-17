@@ -11,6 +11,7 @@ ExecStartPre=/root/antizapret/up.sh
 ExecStart=/root/antizapret/az.sh
 ExecStopPost=/root/antizapret/down.sh
 Restart=on-failure
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
