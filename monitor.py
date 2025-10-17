@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import argparse
 import json
@@ -6,9 +5,11 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+from typing import Dict, Tuple, Callable
 
 DEFAULT_STATE_PATH = "/etc/openvpn/server/logs/state.json"
+STATE_VERSION = 4  # bumped for the cleaned layout
 
 # ---------- Colors / Symbols ----------
 def make_style(no_color: bool, ascii_symbols: bool):
@@ -44,133 +45,118 @@ def human_bytes(n: int) -> str:
 # ---------- Parsing ----------
 CLIENT_LIST_RE = re.compile(r"^\s*CLIENT_LIST(?:[\t,])")
 
-def parse_status(path: str) -> List[Tuple[str, str, int, int, str]]:
-    """
-    Returns rows: (cn, real, rx, tx, since)
-    Supports:
-      - v3 lines: CLIENT_LIST <sep> CN <sep> Real <sep> ... <sep> RX <sep> TX <sep> Since ...
-      - v2 CSV with header
-    """
-    rows: List[Tuple[str, str, int, int, str]] = []
+def parse_date(d: str) -> datetime:
+    return datetime.strptime(d, "%Y-%m-%d %H:%M:%S")
+
+def parse_status(path: str) -> Dict[str, Tuple[str, str, int, int, datetime, int, int]]:
+    by_cn: Dict[str, Tuple[str, str, int, int, datetime, int, int]] = {}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
-        return rows
+        return by_cn
 
-    # First pass: try v3 CLIENT_LIST (tab or comma separated)
-    v3_hits = 0
-    for line in lines:
-        if CLIENT_LIST_RE.match(line):
-            normalized = line.replace("\t", ",")
-            parts = [p.strip() for p in normalized.split(",")]
-            # Expected indexes:
-            # 0=CLIENT_LIST, 1=CN, 2=Real, 5=RX, 6=TX, 7=Since, 8=UnixTime, ...
-            if len(parts) >= 8:
-                cn = parts[1]
-                if not cn or cn == "UNDEF":
-                    continue
-                real = parts[2] if len(parts) > 2 else ""
-                try:
-                    rx = int(parts[5]) if len(parts) > 5 else 0
-                    tx = int(parts[6]) if len(parts) > 6 else 0
-                except ValueError:
-                    rx = 0
-                    tx = 0
-                since = parts[7] if len(parts) > 7 else ""
-                rows.append((cn, real, rx, tx, since))
-                v3_hits += 1
-
-    if v3_hits > 0:
-        return rows
-
-    # Second pass: v2 CSV
-    header = "Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since"
+    # v2 CSV
+    cl_header = "HEADER,CLIENT_LIST,Common Name,Real Address,Virtual Address,Virtual IPv6 Address,Bytes Received,Bytes Sent,Connected Since,Connected Since (time_t),Username,Client ID,Peer ID,Data Channel Cipher"
+    rt_header = "HEADER,ROUTING_TABLE,Virtual Address,Common Name,Real Address,Last Ref,Last Ref (time_t)"
     try:
-        start = lines.index(header)
+        start = lines.index(cl_header)
+        end = lines.index(rt_header)
     except ValueError:
-        start = -1
+        return by_cn
 
-    if start >= 0:
-        for line in lines[start + 1 :]:
-            if line.startswith("ROUTING TABLE") or line.startswith("ROUTING_TABLE"):
-                break
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 5:
-                continue
-            cn = parts[0]
-            if not cn or cn == "UNDEF" or cn == "Common Name":
-                continue
-            real = parts[1]
-            try:
-                rx = int(parts[2]); tx = int(parts[3])
-            except ValueError:
-                continue
-            since = parts[4]
-            rows.append((cn, real, rx, tx, since))
+    for line in lines[start + 1:end]:
+        parts = [p.strip() for p in line.split(",")]
+        assert parts[0] == "CLIENT_LIST"
+        cn = parts[1]
+        rip = parts[2]
+        vip = parts[3]
+        # this swap is intentional, seems 'Sent' means the client downloaded and 'Recieved' -- uploaded
+        tx = int(parts[5])
+        rx = int(parts[6])
+        since_d = parse_date(parts[7])
+        since_t = int(parts[8])
+        pid = int(parts[11])
 
-    return rows
+        by_cn[cn] = (rip, vip, rx, tx, since_d, since_t, pid)
 
-# ---------- State ----------
+    return by_cn
+
+# ---------- State (clean: no Optionals, no flags) ----------
 class ClientState:
-    __slots__ = ("last_rx", "last_tx", "total_rx", "total_tx", "real", "since", "last_seen")
+    __slots__ = (
+        "base_rx", "base_tx",     # session baseline raw counters (at session start)
+        "real", "virtual",
+        "acc_rx", "acc_tx",       # accumulated totals across finished sessions
+        "since", "pid"          # latest real address, current session "since"
+    )
     def __init__(self):
-        self.last_rx: Optional[int] = None
-        self.last_tx: Optional[int] = None
-        self.total_rx: int = 0
-        self.total_tx: int = 0
-        self.real: str = ""
-        self.since: str = ""
-        self.last_seen: int = 0  # epoch seconds
+        self.base_rx: int = 0
+        self.base_tx: int = 0
 
+        self.acc_rx: int = 0
+        self.acc_tx: int = 0
+
+        self.real: str = ""
+        self.virtual: str = ""
+
+        self.since: datetime = None
+        self.pid = -1
+
+    def total_rx(self) -> int:
+        return self.acc_rx;
+
+    def total_tx(self) -> int:
+        return self.acc_tx;
+
+# ---------- Screen ----------
 def clear_screen():
     sys.stdout.write("\033[H\033[2J")
     sys.stdout.flush()
 
-def print_table(states: Dict[str, ClientState], now: int, grace: int, style: dict):
-    # Header
+def print_table(states: Dict[str, ClientState], style: dict, is_online: Callable[[str], bool]):
+    # Header (two spaces between TX and Last Connected)
     print(
-        f"St {'Client':<28} {'Real Address':<24} "
-        f"{'RX Total':>12} {'TX Total':>12}  {'Last Connected Since':<19}"
-    )
-    print("-" * 123)  # slightly longer separator
+        f"St {'Client':<28} {'Real Address':<24} {'Virtual Address':<16}"
+        f"{'RX Total':>12} {'TX Total':>12}  {'Last Connected Since':>22}  {'Peer ID':>10}")
+
+    print("-" * 148)
 
     # Sort by total traffic desc
     items = sorted(
-        ((st.total_rx + st.total_tx, cn) for cn, st in states.items()),
+        ((st.total_rx() + st.total_tx(), cn) for cn, st in states.items()),
         key=lambda x: x[0],
         reverse=True
     )
 
     for _, cn in items:
         st = states[cn]
-        online = (st.last_seen > 0 and (now - st.last_seen) <= grace)
+        online = is_online(cn)
         sym = style["sym_on"] if online else style["sym_off"]
         if style["use_color"]:
             sym_colored = (
-                f"{style['on']}{sym}{style['reset']}" if online
-                else f"{style['off']}{sym}{style['reset']}"
+                f"{style['on']}{sym}{style['reset']}"
+                if online else f"{style['off']}{sym}{style['reset']}"
             )
         else:
             sym_colored = sym
-        since = (st.since or "")[:19]
-        # Note: two spaces before "Last Connected Since"
+
         print(
             f"{sym_colored} "
             f"{cn:<28} "
-            f"{(st.real or ''):<24} "
-            f"{human_bytes(st.total_rx):>12} "
-            f"{human_bytes(st.total_tx):>12}  "
-            f"{since:<19}"
+            f"{(st.real if online else 'N/A'):<24} "
+            f"{(st.virtual if online else 'N/A'):<16} "
+            f"{human_bytes(st.total_rx()):>12} "
+            f"{human_bytes(st.total_tx()):>12}  "
+            f"{(str(st.since) if online else ''):>22}  "
+            f"{(st.pid if online else '-'):>10}"
         )
+
 
     if not items:
         print("(waiting for clients...)")
 
-
 # ---------- Persistence ----------
-STATE_VERSION = 1
-
 def load_state(path: str) -> Dict[str, ClientState]:
     data: Dict[str, ClientState] = {}
     try:
@@ -191,12 +177,14 @@ def load_state(path: str) -> Dict[str, ClientState]:
     for cn, obj in payload.items():
         try:
             st = ClientState()
-            st.total_rx = int(obj.get("total_rx", 0))
-            st.total_tx = int(obj.get("total_tx", 0))
-            st.real = str(obj.get("real", ""))[:128]
-            st.since = str(obj.get("since", ""))[:64]
-            st.last_seen = int(obj.get("last_seen", 0))
-            # Do NOT restore last_rx/last_tx (raw counters) — they will re-init on first tick.
+            st.base_rx   = int(obj.get("base_rx", 0))
+            st.base_tx   = int(obj.get("base_tx", 0))
+            st.acc_rx    = int(obj.get("acc_rx", 0))
+            st.acc_tx    = int(obj.get("acc_tx", 0))
+            st.real      = ""
+            st.virtual   = ""
+            st.since     = parse_date(obj.get("since", ""))
+            st.pid       = int(obj.get("pid", "-2"))
             data[cn] = st
         except Exception:
             continue
@@ -219,11 +207,12 @@ def save_state(path: str, states: Dict[str, ClientState]):
         "saved_at": int(time.time()),
         "clients": {
             cn: {
-                "total_rx": st.total_rx,
-                "total_tx": st.total_tx,
-                "real": st.real,
-                "since": st.since,
-                "last_seen": st.last_seen,
+                "base_rx": st.base_rx,
+                "base_tx": st.base_tx,
+                "acc_rx": st.acc_rx,
+                "acc_tx": st.acc_tx,
+                "since": str(st.since),
+                "pid": st.pid,
             }
             for cn, st in states.items()
         },
@@ -232,94 +221,77 @@ def save_state(path: str, states: Dict[str, ClientState]):
 
 # ---------- Main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Realtime OpenVPN usage viewer (Python) with optional persistence")
+    ap = argparse.ArgumentParser(
+        description="Realtime OpenVPN usage viewer (Python) — clean, session-aware, aligned, optional persistence"
+    )
     ap.add_argument("status_file", nargs="?", default="/etc/openvpn/server/logs/vpn-udp-status.log",
                     help="Path to openvpn-status.log")
     ap.add_argument("interval", nargs="?", type=float, default=1.0,
                     help="Refresh interval seconds (default: 1)")
-    ap.add_argument("grace", nargs="?", type=int, default=10,
-                    help="Seconds since last seen to keep Online (default: 10)")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     ap.add_argument("--ascii", action="store_true", help="Use ASCII symbols instead of ●/○")
-    # Optional persistence flag with optional value:
-    #   --persist            -> uses DEFAULT_STATE_PATH
-    #   --persist /path.json -> uses custom path
+    # Optional persistence:
+    #   --persist            -> uses ./state.json
+    #   --persist /path.json -> custom path
     ap.add_argument("--persist", nargs="?", const=DEFAULT_STATE_PATH, default=None,
                     help=f"Enable persistence; optional path (default: {DEFAULT_STATE_PATH})")
-    ap.add_argument("--persist-interval", type=int, default=5,
-                    help="How often to save state in seconds (default: 5)")
     args = ap.parse_args()
 
     style = make_style(no_color=args.no_color, ascii_symbols=args.ascii)
-
-    # Load state if requested
-    states: Dict[str, ClientState]
-    if args.persist:
-        states = load_state(args.persist)
-    else:
-        states = {}
+    states: Dict[str, ClientState] = load_state(args.persist) if args.persist else {}
 
     last_save = 0
 
     try:
         while True:
             now = int(time.time())
-            rows = parse_status(args.status_file)
+            # clear_screen()
+            snapshot = parse_status(args.status_file)  # CN -> (real, rx, tx, since)
 
-            seen_this_tick = set()
-
-            # Update states
-            for cn, real, rx, tx, since in rows:
+            for cn, (rip, vip, rx, tx, since, _, pid) in snapshot.items():
                 st = states.get(cn)
                 if st is None:
                     st = ClientState()
                     states[cn] = st
-
-                # delta logic with reconnect reset detection
-                if st.last_rx is not None:
-                    d_rx = rx - st.last_rx
-                    if d_rx < 0:
-                        d_rx = rx
+                    # first sighting → lock baseline at current raw counters
+                    st.acc_rx = st.base_rx = rx
+                    st.acc_tx = st.base_tx = tx
+                    st.since  = since
+                    st.real = rip
+                    st.virtual = vip
+                    st.pid = pid
                 else:
-                    d_rx = 0
+                    if pid != st.pid and since != st.since:
+                        st.base_rx = 0
+                        st.base_tx = 0
 
-                if st.last_tx is not None:
-                    d_tx = tx - st.last_tx
-                    if d_tx < 0:
-                        d_tx = tx
-                else:
-                    d_tx = 0
+                    st.acc_rx += (rx - st.base_rx)
+                    st.acc_tx += (tx - st.base_tx)
+                    # start new baseline at current raw counters
+                    st.base_rx = rx
+                    st.base_tx = tx
+                    st.since   = since
+                    st.real = rip
+                    st.virtual = vip
 
-                st.total_rx += max(0, d_rx)
-                st.total_tx += max(0, d_tx)
-                st.last_rx = rx
-                st.last_tx = tx
-                if real:
-                    st.real = real
-                if since:
-                    st.since = since
-                st.last_seen = now
-                seen_this_tick.add(cn)
 
+            is_online = lambda n: n in snapshot
             # Render
             clear_screen()
-            print_table(states, now, args.grace, style)
+            print_table(states, style, is_online)
             sys.stdout.flush()
 
-            # Periodic save if persistence enabled
-            if args.persist and (now - last_save >= args.persist_interval):
+            # Periodic save
+            if args.persist:
                 try:
                     save_state(args.persist, states)
-                    last_save = now
                 except Exception:
-                    # Non-fatal: just skip this save
                     pass
 
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
     finally:
-        # Final save on exit if persistence enabled
         if args.persist:
             try:
                 save_state(args.persist, states)
@@ -328,3 +300,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
