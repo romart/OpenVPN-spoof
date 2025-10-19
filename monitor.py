@@ -7,10 +7,10 @@ import re
 import sys
 import time
 from datetime import datetime
-from typing import Dict, Tuple, Callable
+from typing import Dict, Tuple, Callable, Optional
 
 DEFAULT_STATE_PATH = "/etc/openvpn/server/logs/state.json"
-STATE_VERSION = 4  # bumped for the cleaned layout
+STATE_VERSION = 5  # bump for on-disk schema stability
 
 # ---------- Colors / Symbols ----------
 def make_style(no_color: bool, ascii_symbols: bool):
@@ -43,72 +43,132 @@ def human_bytes(n: int) -> str:
         i += 1
     return f"{x:.2f} {units[i]}"
 
-# ---------- Parsing ----------
+# ---------- Parsing (status-version 3 preferred) ----------
 CLIENT_LIST_RE = re.compile(r"^\s*CLIENT_LIST(?:[\t,])")
+HEADER_CL_RE   = re.compile(r"^\s*HEADER[\t,]CLIENT_LIST[\t,]")
+HEADER_RT_RE   = re.compile(r"^\s*HEADER[\t,]ROUTING_TABLE[\t,]")
 
-def parse_date(d: str) -> datetime:
-    return datetime.strptime(d, "%Y-%m-%d %H:%M:%S")
+def parse_date(s: str) -> Optional[datetime]:
+    s = s.strip()
+    if not s:
+        return None
+    # OpenVPN v3 uses "YYYY-MM-DD HH:MM:SS"
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
 
-def parse_status(path: str) -> Dict[str, Tuple[str, str, int, int, datetime, int, int]]:
-    by_cn: Dict[str, Tuple[str, str, int, int, datetime, int, int]] = {}
+def parse_status(path: str) -> Dict[str, Tuple[str, str, int, int, Optional[datetime], int, int]]:
+    """
+    Return dict by CN:
+      CN -> (real_ip, virt_ip, rx, tx, since_dt, since_unix, peer_id)
+
+    NOTES:
+    - We follow your mapping where 'Bytes Sent' (from server) is what the client downloaded (RX),
+      and 'Bytes Received' is what the client uploaded (TX). We'll name the accumulators RX/TX
+      the same way your table shows them.
+    """
+    by_cn: Dict[str, Tuple[str, str, int, int, Optional[datetime], int, int]] = {}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
         return by_cn
 
-    # v2 CSV
-    cl_header = "HEADER,CLIENT_LIST,Common Name,Real Address,Virtual Address,Virtual IPv6 Address,Bytes Received,Bytes Sent,Connected Since,Connected Since (time_t),Username,Client ID,Peer ID,Data Channel Cipher"
-    rt_header = "HEADER,ROUTING_TABLE,Virtual Address,Common Name,Real Address,Last Ref,Last Ref (time_t)"
-    try:
-        start = lines.index(cl_header)
-        end = lines.index(rt_header)
-    except ValueError:
+    # Find the CLIENT_LIST block between HEADER,CLIENT_LIST and HEADER,ROUTING_TABLE
+    start = end = -1
+    for i, line in enumerate(lines):
+        if start < 0 and HEADER_CL_RE.match(line):
+            start = i
+        elif start >= 0 and HEADER_RT_RE.match(line):
+            end = i
+            break
+
+    if start < 0 or end < 0 or end <= start:
         return by_cn
 
-    for line in lines[start + 1:end]:
-        parts = [p.strip() for p in line.split(",")]
-        assert parts[0] == "CLIENT_LIST"
-        cn = parts[1]
-        rip = parts[2]
-        vip = parts[3]
-        # this swap is intentional, seems 'Sent' means the client downloaded and 'Recieved' -- uploaded
-        tx = int(parts[5])
-        rx = int(parts[6])
-        since_d = parse_date(parts[7])
-        since_t = int(parts[8])
-        pid = int(parts[11])
+    for line in lines[start + 1 : end]:
+        if not CLIENT_LIST_RE.match(line):
+            continue
+        # normalize to commas
+        parts = [p.strip() for p in line.replace("\t", ",").split(",")]
+        # Columns (v3):
+        # 0: CLIENT_LIST
+        # 1: Common Name
+        # 2: Real Address
+        # 3: Virtual Address
+        # 4: Virtual IPv6 Address
+        # 5: Bytes Received
+        # 6: Bytes Sent
+        # 7: Connected Since (YYYY-MM-DD HH:MM:SS)
+        # 8: Connected Since (time_t)
+        # 9: Username
+        # 10: Client ID
+        # 11: Peer ID
+        # 12: Data Channel Cipher
+        if len(parts) < 12:
+            continue
+        cn   = parts[1]
+        if not cn or cn == "UNDEF":
+            continue
 
-        by_cn[cn] = (rip, vip, rx, tx, since_d, since_t, pid)
+        real = parts[2]
+        virt = parts[3]
+        try:
+            bytes_received = int(parts[5])  # server RX from client (client uploaded)
+            bytes_sent     = int(parts[6])  # server TX to client (client downloaded)
+        except ValueError:
+            continue
+
+        # Your semantics: show client RX (download) and TX (upload)
+        rx = bytes_sent     # what client downloaded
+        tx = bytes_received # what client uploaded
+
+        since_dt = parse_date(parts[7])
+        try:
+            since_unix = int(parts[8])
+        except ValueError:
+            since_unix = 0
+
+        try:
+            peer_id = int(parts[11])
+        except ValueError:
+            peer_id = -1
+
+        by_cn[cn] = (real, virt, rx, tx, since_dt, since_unix, peer_id)
 
     return by_cn
 
-# ---------- State (clean: no Optionals, no flags) ----------
+# ---------- State (no Optionals / flags; delta accounting) ----------
 class ClientState:
-    __slots__ = (
-        "base_rx", "base_tx",     # session baseline raw counters (at session start)
-        "real", "virtual",
-        "acc_rx", "acc_tx",       # accumulated totals across finished sessions
-        "since", "pid"          # latest real address, current session "since"
-    )
+    """
+    Delta model:
+      - base_rx/tx = raw counters at the *start* of the current session (or last tick if same session)
+      - acc_rx/tx  = accumulated totals from *finished* ticks/sessions
+      - On each tick in the same session:
+          acc += (raw - base); base = raw
+        (i.e., we add just the delta since last tick)
+      - On session change (Peer ID or Connected-Since changes OR counters decrease):
+          DO NOT add a delta for this tick; instead reset base to current raw,
+          so the new session starts cleanly.
+    """
+    __slots__ = ("base_rx", "base_tx", "acc_rx", "acc_tx", "real", "virtual", "since", "peer_id")
+
     def __init__(self):
         self.base_rx: int = 0
         self.base_tx: int = 0
-
-        self.acc_rx: int = 0
-        self.acc_tx: int = 0
-
-        self.real: str = ""
+        self.acc_rx:  int = 0
+        self.acc_tx:  int = 0
+        self.real:    str = ""
         self.virtual: str = ""
-
-        self.since: datetime = None
-        self.pid = -1
+        self.since:   Optional[datetime] = None
+        self.peer_id: int = -1
 
     def total_rx(self) -> int:
-        return self.acc_rx;
+        return self.acc_rx
 
     def total_tx(self) -> int:
-        return self.acc_tx;
+        return self.acc_tx
 
 # ---------- Screen ----------
 def clear_screen():
@@ -119,11 +179,10 @@ def print_table(states: Dict[str, ClientState], style: dict, is_online: Callable
     # Header (two spaces between TX and Last Connected)
     print(
         f"St {'Client':<28} {'Real Address':<24} {'Virtual Address':<16}"
-        f"{'RX Total':>12} {'TX Total':>12}  {'Last Connected Since':>22}  {'Peer ID':>10}")
-
+        f"{'RX Total':>12} {'TX Total':>12}  {'Last Connected Since':>22}  {'Peer ID':>10}"
+    )
     print("-" * 148)
 
-    # Sort by total traffic desc
     items = sorted(
         ((st.total_rx() + st.total_tx(), cn) for cn, st in states.items()),
         key=lambda x: x[0],
@@ -136,11 +195,12 @@ def print_table(states: Dict[str, ClientState], style: dict, is_online: Callable
         sym = style["sym_on"] if online else style["sym_off"]
         if style["use_color"]:
             sym_colored = (
-                f"{style['on']}{sym}{style['reset']}"
-                if online else f"{style['off']}{sym}{style['reset']}"
+                f"{style['on']}{sym}{style['reset']}" if online else f"{style['off']}{sym}{style['reset']}"
             )
         else:
             sym_colored = sym
+
+        since_str = st.since.strftime("%Y-%m-%d %H:%M:%S") if (online and st.since) else ""
 
         print(
             f"{sym_colored} "
@@ -149,10 +209,9 @@ def print_table(states: Dict[str, ClientState], style: dict, is_online: Callable
             f"{(st.virtual if online else 'N/A'):<16} "
             f"{human_bytes(st.total_rx()):>12} "
             f"{human_bytes(st.total_tx()):>12}  "
-            f"{(str(st.since) if online else ''):>22}  "
-            f"{(st.pid if online else '-'):>10}"
+            f"{since_str:>22}  "
+            f"{(st.peer_id if online else '-'):>10}"
         )
-
 
     if not items:
         print("(waiting for clients...)")
@@ -178,14 +237,15 @@ def load_state(path: str) -> Dict[str, ClientState]:
     for cn, obj in payload.items():
         try:
             st = ClientState()
-            st.base_rx   = int(obj.get("base_rx", 0))
-            st.base_tx   = int(obj.get("base_tx", 0))
-            st.acc_rx    = int(obj.get("acc_rx", 0))
-            st.acc_tx    = int(obj.get("acc_tx", 0))
-            st.real      = ""
-            st.virtual   = ""
-            st.since     = parse_date(obj.get("since", ""))
-            st.pid       = int(obj.get("pid", "-2"))
+            st.base_rx = int(obj.get("base_rx", 0))
+            st.base_tx = int(obj.get("base_tx", 0))
+            st.acc_rx  = int(obj.get("acc_rx", 0))
+            st.acc_tx  = int(obj.get("acc_tx", 0))
+            st.real    = str(obj.get("real", ""))[:128]
+            st.virtual = str(obj.get("virtual", ""))[:64]
+            since_iso  = obj.get("since_iso", "")
+            st.since   = datetime.fromisoformat(since_iso) if since_iso else None
+            st.peer_id = int(obj.get("peer_id", -1))
             data[cn] = st
         except Exception:
             continue
@@ -212,8 +272,10 @@ def save_state(path: str, states: Dict[str, ClientState]):
                 "base_tx": st.base_tx,
                 "acc_rx": st.acc_rx,
                 "acc_tx": st.acc_tx,
-                "since": str(st.since),
-                "pid": st.pid,
+                "real": st.real,
+                "virtual": st.virtual,
+                "since_iso": (st.since.strftime("%Y-%m-%d %H:%M:%S") if st.since else ""),
+                "peer_id": st.peer_id,
             }
             for cn, st in states.items()
         },
@@ -232,12 +294,12 @@ def main():
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     ap.add_argument("--ascii", action="store_true", help="Use ASCII symbols instead of ●/○")
     # Optional persistence:
-    #   --persist            -> uses ./state.json
-    #   --persist /path.json -> custom path
     ap.add_argument("--persist", nargs="?", const=DEFAULT_STATE_PATH, default=None,
                     help=f"Enable persistence; optional path (default: {DEFAULT_STATE_PATH})")
-    args = ap.parse_args()
+    ap.add_argument("--persist-interval", type=int, default=5,
+                    help="Seconds between state saves when --persist is set (default: 5)")
 
+    args = ap.parse_args()
     style = make_style(no_color=args.no_color, ascii_symbols=args.ascii)
     states: Dict[str, ClientState] = load_state(args.persist) if args.persist else {}
 
@@ -245,49 +307,67 @@ def main():
 
     try:
         while True:
-            now = int(time.time())
-            # clear_screen()
-            snapshot = parse_status(args.status_file)  # CN -> (real, rx, tx, since)
+            snapshot = parse_status(args.status_file)  # CN -> (real, virt, rx, tx, since_dt, since_unix, pid)
 
-            for cn, (rip, vip, rx, tx, since, _, pid) in snapshot.items():
+            # Update per-CN state with safe delta accounting
+            for cn, (real, virt, rx, tx, since_dt, _, peer_id) in snapshot.items():
                 st = states.get(cn)
                 if st is None:
+                    # First sighting: initialize baselines; do NOT add to accumulators this tick
                     st = ClientState()
-                    states[cn] = st
-                    # first sighting → lock baseline at current raw counters
-                    st.acc_rx = st.base_rx = rx
-                    st.acc_tx = st.base_tx = tx
-                    st.since  = since
-                    st.real = rip
-                    st.virtual = vip
-                    st.pid = pid
-                else:
-                    if pid != st.pid and since != st.since:
-                        st.base_rx = 0
-                        st.base_tx = 0
-
-                    st.acc_rx += (rx - st.base_rx)
-                    st.acc_tx += (tx - st.base_tx)
-                    # start new baseline at current raw counters
                     st.base_rx = rx
                     st.base_tx = tx
-                    st.since   = since
-                    st.real = rip
-                    st.virtual = vip
+                    st.real    = real
+                    st.virtual = virt
+                    st.since   = since_dt
+                    st.peer_id = peer_id
+                    states[cn] = st
+                    continue
 
+                # Detect session change: new Peer ID OR new "Connected Since" OR counter decrease
+                session_changed = False
+                if st.peer_id != -1 and peer_id != st.peer_id:
+                    session_changed = True
+                elif st.since and since_dt and since_dt != st.since:
+                    session_changed = True
+                elif rx < st.base_rx or tx < st.base_tx:
+                    session_changed = True
 
-            is_online = lambda n: n in snapshot
+                if session_changed:
+                    # Reset baselines to current raw counters; DO NOT add a delta this tick
+                    st.base_rx = rx
+                    st.base_tx = tx
+                    st.since   = since_dt or st.since
+                    st.peer_id = peer_id
+                else:
+                    # Same session → add delta since last tick, then move baseline to current
+                    st.acc_rx += (rx - st.base_rx)
+                    st.acc_tx += (tx - st.base_tx)
+                    st.base_rx = rx
+                    st.base_tx = tx
+                    # keep since/peer_id as-is
+
+                # Always refresh live addresses
+                st.real    = real or st.real
+                st.virtual = virt or st.virtual
+
+            # Online/Offline: membership in snapshot
+            is_online = lambda name: name in snapshot
+
             # Render
             clear_screen()
             print_table(states, style, is_online)
             sys.stdout.flush()
 
-            # Periodic save
+            # Persist periodically
             if args.persist:
-                try:
-                    save_state(args.persist, states)
-                except Exception:
-                    pass
+                now = int(time.time())
+                if now - last_save >= args.persist_interval:
+                    try:
+                        save_state(args.persist, states)
+                        last_save = now
+                    except Exception:
+                        pass
 
             time.sleep(args.interval)
     except KeyboardInterrupt:
