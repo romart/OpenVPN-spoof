@@ -282,6 +282,49 @@ def save_state(path: str, states: Dict[str, ClientState]):
     }
     atomic_write(path, json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
+def update_states(states, snapshot):
+    """Apply one status snapshot using the CLI delta-accounting rules."""
+    for cn, (real, virt, rx, tx, since_dt, _, peer_id) in snapshot.items():
+        st = states.get(cn)
+        if st is None:
+            # First sighting: initialize baselines; do NOT add to accumulators this tick
+            st = ClientState()
+            st.base_rx = rx
+            st.base_tx = tx
+            st.real    = real
+            st.virtual = virt
+            st.since   = since_dt
+            st.peer_id = peer_id
+            states[cn] = st
+            continue
+
+        # Detect session change: new Peer ID OR new "Connected Since" OR counter decrease
+        session_changed = False
+        if st.peer_id != -1 and peer_id != st.peer_id:
+            session_changed = True
+        elif st.since and since_dt and since_dt != st.since:
+            session_changed = True
+        elif rx < st.base_rx or tx < st.base_tx:
+            session_changed = True
+
+        if session_changed:
+            # Reset baselines to current raw counters; DO NOT add a delta this tick
+            st.base_rx = rx
+            st.base_tx = tx
+            st.since   = since_dt or st.since
+            st.peer_id = peer_id
+        else:
+            # Same session → add delta since last tick, then move baseline to current
+            st.acc_rx += (rx - st.base_rx)
+            st.acc_tx += (tx - st.base_tx)
+            st.base_rx = rx
+            st.base_tx = tx
+            # keep since/peer_id as-is
+
+        # Always refresh live addresses
+        st.real    = real or st.real
+        st.virtual = virt or st.virtual
+
 # ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser(
@@ -309,47 +352,7 @@ def main():
         while True:
             snapshot = parse_status(args.status_file)  # CN -> (real, virt, rx, tx, since_dt, since_unix, pid)
 
-            # Update per-CN state with safe delta accounting
-            for cn, (real, virt, rx, tx, since_dt, _, peer_id) in snapshot.items():
-                st = states.get(cn)
-                if st is None:
-                    # First sighting: initialize baselines; do NOT add to accumulators this tick
-                    st = ClientState()
-                    st.base_rx = rx
-                    st.base_tx = tx
-                    st.real    = real
-                    st.virtual = virt
-                    st.since   = since_dt
-                    st.peer_id = peer_id
-                    states[cn] = st
-                    continue
-
-                # Detect session change: new Peer ID OR new "Connected Since" OR counter decrease
-                session_changed = False
-                if st.peer_id != -1 and peer_id != st.peer_id:
-                    session_changed = True
-                elif st.since and since_dt and since_dt != st.since:
-                    session_changed = True
-                elif rx < st.base_rx or tx < st.base_tx:
-                    session_changed = True
-
-                if session_changed:
-                    # Reset baselines to current raw counters; DO NOT add a delta this tick
-                    st.base_rx = rx
-                    st.base_tx = tx
-                    st.since   = since_dt or st.since
-                    st.peer_id = peer_id
-                else:
-                    # Same session → add delta since last tick, then move baseline to current
-                    st.acc_rx += (rx - st.base_rx)
-                    st.acc_tx += (tx - st.base_tx)
-                    st.base_rx = rx
-                    st.base_tx = tx
-                    # keep since/peer_id as-is
-
-                # Always refresh live addresses
-                st.real    = real or st.real
-                st.virtual = virt or st.virtual
+            update_states(states, snapshot)
 
             # Online/Offline: membership in snapshot
             is_online = lambda name: name in snapshot

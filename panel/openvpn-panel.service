@@ -1,0 +1,27 @@
+[Unit]
+Description=OpenVPN web control panel backend
+After=network.target openvpn-server@vpn-udp.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/openvpn-panel
+EnvironmentFile=/etc/openvpn-panel.env
+ExecStart=/usr/bin/python3 /opt/openvpn-panel/app.py
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=openvpn-panel
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+StateDirectory=openvpn-panel
+StateDirectoryMode=0700
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/openvpn /root/antizapret /run/openvpn-panel /var/lib/openvpn-panel
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+# PAM and Easy-RSA run on the host; nginx has neither CA keys nor Docker access.
+
+[Install]
+WantedBy=multi-user.target

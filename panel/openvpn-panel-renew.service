@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew OpenVPN panel TLS certificates
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/openvpn-panel/certbot.sh renew --quiet --deploy-hook /opt/openvpn-panel/reload-nginx.sh

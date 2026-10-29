@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    # Avoid introducing Docker bridge/NAT/FORWARD rules on the VPN server.
+    network_mode: host
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    volumes:
+      - /opt/openvpn-panel/nginx:/etc/nginx/conf.d:ro
+      - /run/openvpn-panel:/run/openvpn-panel:ro
+      - /var/lib/openvpn-panel/letsencrypt:/etc/letsencrypt:ro
+      - /var/lib/openvpn-panel/acme:/var/www/acme:ro
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
