@@ -63,7 +63,13 @@ make -C /usr/local/src/openvpn uninstall || true
 rm -rf /usr/local/src/openvpn
 apt-get update
 apt-get dist-upgrade -y --fix-missing
-apt-get install -y openvpn curl tar build-essential pkg-config libssl-dev libsystemd-dev libnl-genl-3-dev libcap-ng-dev
+# Debian 13 splits systemd.pc into systemd-dev. Older supported releases
+# provide it without that separate package.
+SYSTEMD_DEV_PACKAGES=(libsystemd-dev)
+if apt-cache show systemd-dev >/dev/null 2>&1; then
+	SYSTEMD_DEV_PACKAGES+=(systemd-dev)
+fi
+apt-get install -y openvpn curl tar build-essential pkg-config libssl-dev "${SYSTEMD_DEV_PACKAGES[@]}" libnl-genl-3-dev libcap-ng-dev
 apt-get autoremove --purge -y
 apt-get clean
 VERSION="$(openvpn --version | head -n 1 | awk '{print $2}')"
