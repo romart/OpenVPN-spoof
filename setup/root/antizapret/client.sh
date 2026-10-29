@@ -6,6 +6,9 @@
 #
 set -e
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROUTES_FILE=${ROUTES_FILE:-"$SCRIPT_DIR/wl_routes.txt"}
+
 handle_error() {
 	echo ""
 	echo "Error occurred at line $1 while executing: $2"
@@ -43,17 +46,41 @@ getServerIP(){
 render() {
 	local IFS=''
 	local File="$1"
-	while read -r line; do
+	while read -r line || [[ -n "$line" ]]; do
 		while [[ "$line" =~ (\$\{[a-zA-Z_][a-zA-Z_0-9]*\}) ]]; do
 			local LHS=${BASH_REMATCH[1]}
 			local RHS="$(eval echo "\"$LHS\"")"
 			line=${line//$LHS/$RHS}
 		done
 		echo "$line"
-	done < $File
+	done < "$File"
 }
 
+writeOpenVPNProfiles() (
+	# Both files embed exactly the same identity; only routing differs.
+	local template="$1" default_profile="$2" routed_profile="$3"
+	if [[ ! -f "$ROUTES_FILE" || ! -r "$ROUTES_FILE" ]]; then
+		echo "Cannot read routes file: $ROUTES_FILE" >&2
+		return 1
+	fi
+	umask 077
+	mkdir -p -- "$(dirname -- "$default_profile")"
+	render "$template" > "$default_profile"
+	cp -- "$default_profile" "$routed_profile"
+	{
+		printf '\n# Only the networks listed below use the VPN.\nroute-nopull\n'
+		# Normalize Windows line endings; do not render or execute route file contents.
+		sed 's/\r$//' "$ROUTES_FILE"
+		printf '\n'
+	} >> "$routed_profile"
+	chmod 600 -- "$default_profile" "$routed_profile"
+)
+
 addOpenVPN(){
+	if [[ ! -f "$ROUTES_FILE" || ! -r "$ROUTES_FILE" ]]; then
+		echo "Cannot read routes file: $ROUTES_FILE" >&2
+		return 1
+	fi
 	mkdir -p /etc/openvpn/easyrsa3
 	cd /etc/openvpn/easyrsa3
 
@@ -109,7 +136,9 @@ addOpenVPN(){
 	FILE_NAME="${CLIENT_NAME#}"
 	FILE_NAME="${FILE_NAME#vpn-}"
 	FILE_NAME="${FILE_NAME}-${SERVER_IP}"
-	render "/etc/openvpn/client/templates/vpn-udp.conf" > "/root/antizapret/client/openvpn/vpn-udp/vpn-$FILE_NAME-udp.ovpn"
+	writeOpenVPNProfiles "/etc/openvpn/client/templates/vpn-udp.conf" \
+		"/root/antizapret/client/openvpn/vpn-udp/vpn-$FILE_NAME-udp.ovpn" \
+		"/root/antizapret/client/openvpn/vpn-udp/vpn-$FILE_NAME-udp-routed.ovpn"
 
 	echo "OpenVPN profile files for the client '$CLIENT_NAME' has been (re)created at '/root/antizapret/client/openvpn'"
 }
@@ -136,6 +165,8 @@ deleteOpenVPN(){
 
 	rm -f /root/antizapret/client/openvpn/{antizapret,udp,tcp}/$FILE_NAME.ovpn
 	rm -f /root/antizapret/client/openvpn/{vpn,vpn-udp,vpn-tcp}/vpn-$FILE_NAME.ovpn
+	rm -f "/root/antizapret/client/openvpn/vpn-udp/vpn-$FILE_NAME-udp.ovpn" \
+		"/root/antizapret/client/openvpn/vpn-udp/vpn-$FILE_NAME-udp-routed.ovpn"
 	rm -f /etc/openvpn/client/keys/$CLIENT_NAME.crt
 	rm -f /etc/openvpn/client/keys/$CLIENT_NAME.key
 
@@ -167,6 +198,11 @@ recreate(){
 		addOpenVPN >/dev/null
 	fi
 }
+
+# Allow profile generation helpers to be sourced without running the client menu.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+	return
+fi
 
 OPTION=$1
 if ! [[ "$OPTION" =~ ^[1-4]$ ]]; then

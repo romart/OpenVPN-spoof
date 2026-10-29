@@ -1,5 +1,50 @@
 # OpenVPN-spoof
 
+## Default and routed client profiles
+
+Adding a client (`client.sh 1 NAME DAYS`) or recreating profiles (`client.sh 4`)
+generates two files in `/root/antizapret/client/openvpn/vpn-udp/`:
+
+- `vpn-NAME-SERVER_IP-udp.ovpn`: the existing default profile, using the server's
+  full-tunnel routing settings.
+- `vpn-NAME-SERVER_IP-udp-routed.ovpn`: a split-tunnel profile with the same
+  embedded CA, client certificate and private key. It adds `route-nopull` and
+  embeds the contents of `/root/antizapret/wl_routes.txt`.
+
+Edit that separate route file using OpenVPN route directives, for example:
+
+```text
+# Send this network through the VPN
+route 203.0.113.0 255.255.255.0
+# Send a single address through the VPN
+route 198.51.100.5 255.255.255.255
+```
+
+The routed profile ignores server-pushed routes (including default-gateway
+redirection) and DNS settings; other destinations use the client's normal
+connection. See the [OpenVPN route-nopull documentation](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual/).
+Routes are embedded when generating the profile, so clients only need the
+`.ovpn` file. After editing routes, regenerate and redistribute routed profiles:
+
+```sh
+sudo /root/antizapret/client.sh 4
+```
+
+To use another route file, specify an absolute path:
+
+```sh
+sudo env ROUTES_FILE=/root/my-routes.txt /root/antizapret/client.sh 4
+```
+
+The route file must exist and be readable. Removing a client revokes the shared
+certificate for both profiles and deletes both generated files for the current
+server address.
+
+For an existing server, copy the updated `setup/root/antizapret/client.sh` to
+`/root/antizapret/client.sh` and ensure `wl_routes.txt` exists alongside it
+(the repository includes an initial list). Then run option `4`. A full server
+reinstallation or service restart is not required.
+
 ## Move an existing server to another VPS
 
 Use `setup/root/antizapret/migrate.py` from this repository. New installations
