@@ -1,6 +1,7 @@
 import http.client
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -161,6 +162,122 @@ class PanelTests(unittest.TestCase):
         for _ in range(5):
             self.assertFalse(self.panel.login('root', 'wrong'))
         self.assertIsNone(self.panel.login('root', 'test-password'))
+
+    def prepare_revocation(self):
+        self.add_client('phone')
+        self.add_client('phone-other')
+        old = self.profiles / 'vpn-phone-old-endpoint-udp.ovpn'
+        old.write_bytes((self.profiles / 'vpn-phone-192.0.2.1-udp.ovpn').read_bytes())
+        keys = self.vpn / 'client/keys'
+        keys.mkdir(parents=True)
+        (keys / 'phone.crt').write_text((self.pki / 'issued/phone.crt').read_text())
+        (keys / 'phone.key').write_text('private-key')
+        destination = self.vpn / 'server/keys/crl.pem'
+        destination.parent.mkdir(parents=True)
+        destination.write_text('original CRL')
+        return destination
+
+    def revocation_command(self, args, **kwargs):
+        self.assertEqual(args[:2], ['/usr/share/easy-rsa/easyrsa', '--batch'])
+        self.assertEqual(kwargs['cwd'], self.vpn / 'easyrsa3')
+        self.assertEqual(kwargs['env']['EASYRSA_PKI'], str(self.pki))
+        if args[2] == 'revoke':
+            self.assertEqual(args[3], 'phone')
+            index = self.pki / 'index.txt'
+            index.write_text(''.join('R' + line[1:] if line.rstrip().endswith('/CN=phone') else line
+                                     for line in index.read_text().splitlines(keepends=True)))
+        else:
+            self.assertEqual(args[2:], ['gen-crl'])
+            (self.pki / 'crl.pem').write_text('updated CRL')
+        return app.subprocess.CompletedProcess(args, 0, '')
+
+    def test_revoke_updates_crl_and_removes_all_matching_profiles_only(self):
+        destination = self.prepare_revocation()
+        self.login()
+        with patch.object(app.subprocess, 'run', side_effect=self.revocation_command) as run:
+            self.assertEqual(self.request('/api/clients/revoke', 'POST', {'name': 'phone'}, csrf=False)[0], 403)
+            for name, expected in (('server', 400), ('bad;command', 400), ('missing', 404)):
+                self.assertEqual(self.request('/api/clients/revoke', 'POST', {'name': name})[0], expected)
+            run.assert_not_called()
+            self.panel.create_lock.acquire()
+            try:
+                self.assertEqual(self.request('/api/clients/revoke', 'POST', {'name': 'phone'})[0], 409)
+            finally:
+                self.panel.create_lock.release()
+            status, result, _ = self.request('/api/clients/revoke', 'POST', {'name': 'phone'})
+            self.assertEqual(status, 200)
+            self.assertEqual(result['deleted_profiles'], 3)
+            self.assertEqual(run.call_count, 2)
+        self.assertEqual(destination.read_text(), 'updated CRL')
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(len(list(self.profiles.glob('*.ovpn'))), 2)
+        self.assertFalse((self.vpn / 'client/keys/phone.key').exists())
+        self.assertEqual([c['name'] for c in self.panel.catalog()], ['phone-other'])
+        self.assertEqual(self.request('/api/download?file=vpn-phone-192.0.2.1-udp.ovpn')[0], 404)
+        self.assertIn('phone', [c['name'] for c in self.panel.usage()['clients']])
+
+    def test_failed_crl_update_can_be_retried_without_second_revocation(self):
+        destination = self.prepare_revocation()
+        self.login()
+        def fail_crl(args, **kwargs):
+            if args[2] == 'gen-crl':
+                return app.subprocess.CompletedProcess(args, 1, 'CRL generation failed')
+            return self.revocation_command(args, **kwargs)
+        with patch.object(app.subprocess, 'run', side_effect=fail_crl), self.assertLogs(app.LOG, level='ERROR'):
+            self.assertEqual(self.request('/api/clients/revoke', 'POST', {'name': 'phone'})[0], 500)
+        self.assertEqual(destination.read_text(), 'original CRL')
+        self.assertEqual(len(list(self.profiles.glob('*.ovpn'))), 5)
+        with patch.object(app.subprocess, 'run', side_effect=self.revocation_command) as run:
+            self.assertEqual(self.request('/api/clients/revoke', 'POST', {'name': 'phone'})[0], 200)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][-1], 'gen-crl')
+
+    @unittest.skipUnless(Path('/usr/share/easy-rsa/easyrsa').is_file(), 'Easy-RSA is not installed')
+    def test_real_easyrsa_revocation_with_isolated_ca(self):
+        vpn = self.root / 'isolated-vpn'
+        project = self.root / 'isolated-project'
+        pki = vpn / 'easyrsa3/pki'
+        pki.parent.mkdir(parents=True)
+        env = dict(os.environ, EASYRSA_PKI=str(pki), EASYRSA_BATCH='1',
+                   EASYRSA_ALGO='ec', EASYRSA_CURVE='prime256v1', EASYRSA_REQ_CN='Panel test CA')
+        for command in (('init-pki',), ('build-ca', 'nopass'), ('build-client-full', 'phone', 'nopass')):
+            if command[0] == 'build-client-full':
+                env.pop('EASYRSA_REQ_CN', None)
+            app.subprocess.run(['/usr/share/easy-rsa/easyrsa', '--batch', *command],
+                               env=env, cwd=pki.parent, check=True, capture_output=True, timeout=60)
+        cert = (pki / 'issued/phone.crt').read_text()
+        saved = self.root / 'saved-client.crt'
+        saved.write_text(cert)
+        app.subprocess.run(['openssl', 'verify', '-CAfile', str(pki / 'ca.crt'), str(saved)],
+                           check=True, capture_output=True)
+        profiles = project / 'client/openvpn/vpn-udp'
+        profiles.mkdir(parents=True)
+        for suffix in ('', '-routed'):
+            (profiles / f'phone{suffix}.ovpn').write_text('<cert>' + cert + '</cert>')
+        destination = vpn / 'server/keys/crl.pem'
+        destination.parent.mkdir(parents=True)
+        panel = app.Panel(vpn, project, self.root / 'isolated-state.json')
+        self.assertEqual(panel.revoke('phone')['deleted_profiles'], 2)
+        verify = app.subprocess.run(['openssl', 'verify', '-CAfile', str(pki / 'ca.crt'),
+                                    '-CRLfile', str(destination), '-crl_check', str(saved)],
+                                   capture_output=True, text=True)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn('certificate revoked', verify.stderr)
+        self.assertEqual(panel.revoke('phone')['deleted_profiles'], 0)
+        # Reissuing the same name leaves an old R record beside a new V record.
+        # Easy-RSA retains the old named files, so clear them only in this test PKI.
+        for relative in ('issued/phone.crt', 'private/phone.key', 'reqs/phone.req'):
+            (pki / relative).unlink(missing_ok=True)
+        issued = app.subprocess.run(['/usr/share/easy-rsa/easyrsa', '--batch', 'build-client-full', 'phone', 'nopass'],
+                                    env=env, cwd=pki.parent, capture_output=True, text=True, timeout=60)
+        self.assertEqual(issued.returncode, 0, issued.stdout + issued.stderr)
+        saved.write_text((pki / 'issued/phone.crt').read_text())
+        panel.revoke('phone')
+        verify = app.subprocess.run(['openssl', 'verify', '-CAfile', str(pki / 'ca.crt'),
+                                    '-CRLfile', str(destination), '-crl_check', str(saved)],
+                                   capture_output=True, text=True)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn('certificate revoked', verify.stderr)
 
     def test_shared_usage_accounting_and_persistence(self):
         log = self.vpn / 'server/logs/vpn-udp-status.log'

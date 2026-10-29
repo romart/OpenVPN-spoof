@@ -13,9 +13,11 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import shutil
 import socketserver
 import subprocess
 import threading
+import tempfile
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -136,7 +138,7 @@ class Panel:
         if type(days) is not int or not 1 <= days <= 3650:
             raise ValueError('Certificate lifetime must be 1–3650 days.')
         if not self.create_lock.acquire(blocking=False):
-            raise BlockingIOError('Another client is being created. Try again shortly.')
+            raise BlockingIOError('Another client operation is running. Try again shortly.')
         try:
             pki = self.vpn / 'easyrsa3/pki'
             required = ('ca.crt', 'private/ca.key', 'issued/server.crt', 'private/server.key', 'index.txt')
@@ -157,6 +159,74 @@ class Panel:
             if not client or len(client['profiles']) < 2:
                 raise RuntimeError('Client created, but both profiles were not found. Install the updated client.sh and route file.')
             return client
+        finally:
+            self.create_lock.release()
+
+    def revoke(self, name):
+        if not isinstance(name, str) or not NAME.fullmatch(name) or name == 'server':
+            raise ValueError('Choose a valid client name; server is reserved.')
+        if not self.create_lock.acquire(blocking=False):
+            raise BlockingIOError('Another client operation is running. Try again shortly.')
+        try:
+            pki = self.vpn / 'easyrsa3/pki'
+            records = []
+            for line in (pki / 'index.txt').read_text().splitlines():
+                fields = line.split('\t')
+                if len(fields) >= 6 and re.search(r'(?:^|/)CN=' + re.escape(name) + r'(?:/|$)', fields[5]):
+                    records.append(fields)
+            if not records:
+                raise FileNotFoundError('Client not found.')
+            active = [record for record in records if record[0] in ('V', 'E')]
+            if len(active) > 1 or any(record[0] not in ('V', 'E', 'R') for record in records):
+                raise ValueError('Ambiguous certificate records; manage this client with Easy-RSA.')
+            record = active[0] if active else records[-1]
+            # Capture identity before Easy-RSA moves revoked files. Include old
+            # endpoint filenames, and avoid deleting clients sharing a name prefix.
+            certificates = set()
+            sources = [pki / 'issued' / (name + '.crt'), self.vpn / 'client/keys' / (name + '.crt')]
+            sources.extend(pki / 'revoked/certs_by_serial' / (item[3] + '.crt')
+                           for item in records if re.fullmatch(r'[A-Fa-f0-9]+', item[3]))
+            for path in sources:
+                if path.is_file():
+                    certificate = pem(path.read_text())
+                    if certificate:
+                        certificates.add(certificate)
+            if not certificates:
+                raise ValueError('Cannot locate the client certificate; restore it before revoking/deleting profiles.')
+            profiles = []
+            for path in (self.project / 'client/openvpn/vpn-udp').glob('*.ovpn'):
+                if path.is_symlink() or not path.is_file() or path.stat().st_size > 2_000_000:
+                    continue
+                match = re.search(r'<cert>(.*?)</cert>', path.read_text(), re.S)
+                if match and pem(match[1]) in certificates:
+                    profiles.append(path)
+            env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+                   'HOME': '/root', 'EASYRSA_PKI': str(pki), 'EASYRSA_CRL_DAYS': '3650'}
+            # Retrying a partially completed operation must still publish the CRL.
+            commands = [] if record[0] == 'R' else [('revoke', name)]
+            commands.append(('gen-crl',))
+            for command in commands:
+                result = subprocess.run(['/usr/share/easy-rsa/easyrsa', '--batch', *command],
+                                        cwd=self.vpn / 'easyrsa3', env=env, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+                if result.returncode:
+                    LOG.error('Revocation failed for %s: %s', name, result.stdout[-2000:])
+                    raise RuntimeError('Revocation/CRL update failed; check the panel journal before retrying.')
+            destination = self.vpn / 'server/keys/crl.pem'
+            # Publish atomically and keep CRL readable after OpenVPN drops privileges.
+            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix='.crl-', delete=False) as temp:
+                temporary = Path(temp.name)
+            try:
+                shutil.copyfile(pki / 'crl.pem', temporary)
+                temporary.chmod(0o644)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            for path in profiles:
+                path.unlink(missing_ok=True)
+            for suffix in ('.crt', '.key'):
+                (self.vpn / 'client/keys' / (name + suffix)).unlink(missing_ok=True)
+            return {'name': name, 'revoked': True, 'deleted_profiles': len(profiles)}
         finally:
             self.create_lock.release()
 
@@ -337,6 +407,15 @@ class Handler(BaseHTTPRequestHandler):
             with self.panel.lock:
                 self.panel.sessions.pop(self.token(), None)
             return self.reply(200, {'ok': True}, cookie='')
+        if route == '/api/clients/revoke':
+            try:
+                return self.reply(200, self.panel.revoke(data.get('name')))
+            except FileNotFoundError as error:
+                return self.reply(404, {'error': str(error)})
+            except BlockingIOError as error:
+                return self.reply(409, {'error': str(error)})
+            except ValueError as error:
+                return self.reply(400, {'error': str(error)})
         if route == '/api/clients':
             try:
                 return self.reply(201, self.panel.create(data.get('name'), data.get('days')))

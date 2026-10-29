@@ -51,9 +51,24 @@ async function loadClients() {
       item.append(link, filename);
       downloads.append(item);
     }
+    const actions = cell(row, '');
+    const revoke = document.createElement('button');
+    revoke.className = 'danger';
+    revoke.textContent = 'Revoke & delete';
+    revoke.addEventListener('click', async () => {
+      if (!window.confirm(`Revoke ${client.name} and delete all its generated profiles? Both default and routed profiles will stop working for new connections. Existing sessions may remain connected until disconnected. This cannot be undone.`)) return;
+      revoke.disabled = true;
+      message(`Revoking ${client.name}…`);
+      try {
+        const result = await request('/api/clients/revoke', 'POST', {name: client.name});
+        await loadClients();
+        message(`Revoked ${client.name} and deleted ${result.deleted_profiles} profiles. Existing sessions may remain connected until disconnected.`);
+      } catch (error) { message(error.message); revoke.disabled = false; }
+    });
+    actions.append(revoke);
     body.append(row);
   }
-  if (!data.clients.length) { const row = body.insertRow(); cell(row, 'No clients yet. Create one above.').colSpan = 2; }
+  if (!data.clients.length) { const row = body.insertRow(); cell(row, 'No clients yet. Create one above.').colSpan = 3; }
 }
 async function loadUsage() {
   const data = await request('/api/usage');

@@ -10,6 +10,10 @@ A small administration panel for the OpenVPN server in this repository:
   profiles. Both profiles use the same certificate/key. Revoked and expired
   certificates are excluded from downloads. Existing files are matched to client
   certificates, so filenames retained after migration are supported.
+- Revoke a client and delete all of its generated default/routed profiles,
+  including copies with old endpoint filenames. The action requires confirmation,
+  updates the server CRL atomically, and removes exported client keys. CA records
+  and usage history remain available for auditing; existing backups are retained.
 - View online/offline status, addresses, and persistent download/upload totals
   using the parser and delta accounting shared with `monitor.py`.
 
@@ -57,6 +61,14 @@ For a free DNS hostname instead, [DuckDNS](https://www.duckdns.org/) lets you
 choose a name under `duckdns.org` and set its IPv4 address to the VPS's public IP.
 
 ## Operation
+
+Use **Revoke & delete** on the Configs page to revoke the shared certificate for
+both profile variants. This prevents future connections with downloaded copies
+as well. An already connected session may remain connected until it disconnects
+or renegotiates; this action does not restart the VPN or disconnect other clients.
+See [OpenVPN's revocation behavior](https://openvpn.net/community-docs/revoking-certificates.html).
+If generating/publishing the CRL fails, inspect the backend journal and retry the
+same operation; already-revoked certificates are handled without revoking twice.
 
 ```sh
 # Backend and PAM/client-generation errors

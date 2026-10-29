@@ -3,15 +3,16 @@
 ## Web control panel
 
 The [web panel](panel/README.md) provides root-password login, client creation,
-default/routed profile downloads, a config list, and live usage from `monitor.py`.
+default/routed profile downloads, revocation/deletion, a config list, and live
+usage from `monitor.py`.
 It uses an nginx container with HTTPS on port `443` and automatic Let’s Encrypt
 renewal. Install on the VPN VPS from this checkout:
 
 ```sh
-sudo bash panel/install.sh --ip YOUR_PUBLIC_IPV4 --email you@example.com
+sudo bash panel/install.sh --domain vpn.example.com --email you@example.com
 ```
 
-Or use `--domain vpn.example.com` instead of `--ip`. Allow inbound TCP ports 80
+Or use `--ip YOUR_PUBLIC_IPV4` instead of `--domain`. Allow inbound TCP ports 80
 and 443; see the linked instructions for requirements and operations.
 
 ## Default and routed client profiles
