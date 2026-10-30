@@ -15,6 +15,40 @@ sudo bash panel/install.sh --domain vpn.example.com --email you@example.com
 Or use `--ip YOUR_PUBLIC_IPV4` instead of `--domain`. Allow inbound TCP ports 80
 and 443; see the linked instructions for requirements and operations.
 
+## Installer patch and DCO options
+
+`setup.sh` and `patch-openvpn.sh` use the same patch choices:
+`1` = None, `2` = Random (default), `3` = Strong, `4` = Error-Free.
+Older setup records used a different numbering; use the new menu labels when
+reinstalling. Choosing DCO off explicitly writes `disable-dco`.
+
+DCO needs headers matching the kernel for which DKMS builds its module. If the
+running Debian kernel is too old for its headers to remain in the repositories,
+`openvpn-dco.sh y` installs the matching kernel/header meta-packages (for example,
+`linux-image-cloud-amd64` and `linux-headers-cloud-amd64`) and builds DCO for the
+updated kernel. Exit status `2` means the module is ready for an installed kernel
+and a reboot into that kernel is required. `setup.sh` recognizes this status and
+continues to its normal reboot. The standalone helper does not reboot the VPS.
+Existing DCO modules are not unloaded while serving clients.
+
+To recover a Debian 13 cloud-amd64 VPS with unavailable running-kernel headers:
+
+```sh
+sudo apt-get update
+sudo apt-get install linux-image-cloud-amd64 linux-headers-cloud-amd64 openvpn-dco-dkms
+sudo reboot
+```
+
+After reconnecting, run the updated helper if necessary:
+
+```sh
+sudo /root/antizapret/openvpn-dco.sh y
+```
+
+The helper installs exact running-kernel headers when available. If an Ubuntu or
+custom kernel has neither usable headers nor a DCO module, it reports the missing
+prerequisite rather than selecting an unrelated Debian kernel.
+
 ## Default and routed client profiles
 
 Adding a client (`client.sh 1 NAME DAYS`) or recreating profiles (`client.sh 4`)

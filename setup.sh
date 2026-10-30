@@ -56,11 +56,12 @@ echo "OpenVPN"
 # Спрашиваем о настройках
 echo ""
 echo "Choose a version of the anti-censorship patch for OpenVPN (UDP only):"
-echo "    0) None       - Do not install the anti-censorship patch, or remove it if already installed"
-echo "    1) Strong     - Recommended by default"
-echo "    2) Error-free - Use it if the Strong patch causes a connection error, recommended for Mikrotik routers"
-until [[ "$OPENVPN_PATCH" =~ ^[0-2]$ ]]; do
-	read -rp "Version choice [0-2]: " -e -i 1 OPENVPN_PATCH
+echo "    1) None       - Do not install the anti-censorship patch, or remove it if already installed"
+echo "    2) Random     - Recommended by default, randomly selects Strong or Error-Free"
+echo "    3) Strong     - Better protocol masking"
+echo "    4) Error-Free - Use if Strong causes connection errors, recommended for routers"
+until [[ "$OPENVPN_PATCH" =~ ^[1-4]$ ]]; do
+	read -rp "Version choice [1-4]: " -e -i 2 OPENVPN_PATCH
 done
 echo ""
 echo "OpenVPN DCO lowers CPU load, saves battery on mobile devices, boosts data speeds, and only supports AES-128-GCM, AES-256-GCM and CHACHA20-POLY1305 encryption protocols"
@@ -288,15 +289,18 @@ systemctl disable firewalld &>/dev/null || true
 
 ERRORS=""
 
-if [[ "$OPENVPN_PATCH" != "0" ]]; then
-	if ! /root/antizapret/patch-openvpn.sh "$OPENVPN_PATCH"; then
-		ERRORS+="\n\e[1;31mAnti-censorship patch for OpenVPN has not installed!\e[0m Please run '/root/antizapret/patch-openvpn.sh' after rebooting\n"
-	fi
+if ! /root/antizapret/patch-openvpn.sh "$OPENVPN_PATCH"; then
+	ERRORS+="\n\e[1;31mAnti-censorship patch for OpenVPN has not installed!\e[0m Please run '/root/antizapret/patch-openvpn.sh' after rebooting\n"
 fi
 
-if [[ "$OPENVPN_DCO" == "y" ]]; then
-	if ! /root/antizapret/openvpn-dco.sh "y"; then
-		ERRORS+="\n\e[1;31mOpenVPN DCO has not turn on!\e[0m Please run '/root/antizapret/openvpn-dco.sh' after rebooting\n"
+if /root/antizapret/openvpn-dco.sh "$OPENVPN_DCO"; then
+	:
+else
+	DCO_RESULT=$?
+	if [[ "$DCO_RESULT" == 2 ]]; then
+		echo "DCO is prepared for the updated kernel and will be available after reboot."
+	else
+		ERRORS+="\n\e[1;31mOpenVPN DCO configuration failed!\e[0m Please run '/root/antizapret/openvpn-dco.sh $OPENVPN_DCO' after rebooting\n"
 	fi
 fi
 
